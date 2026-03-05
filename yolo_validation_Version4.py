@@ -394,9 +394,11 @@ def run_validation(args: argparse.Namespace) -> None:
     # Storage:
     # per_class_preds[iou_thresh][class_id] = [(confidence, is_tp), ...]
     # per_class_gt_counts[class_id]         = int
+    # per_class_ious[class_id]              = [iou, ...] (TP IoUs at iou_t == 0.50)
     iou_thresholds  = [round(t, 2) for t in np.arange(0.50, 1.00, 0.05)]
     per_class_preds = {t: {c: [] for c in all_class_ids} for t in iou_thresholds}
     per_class_gt    = {c: 0 for c in all_class_ids}
+    per_class_ious: Dict[int, List[float]] = {c: [] for c in all_class_ids}
 
     n_images_with_gt    = 0
     n_images_no_det     = 0
@@ -455,6 +457,12 @@ def run_validation(args: argparse.Namespace) -> None:
             )
             matched_pred_indices = {m[0] for m in matches}
 
+            # Collect TP IoU values at the primary threshold (0.50) for mIoU
+            if iou_t == 0.50:
+                for _, _, match_iou, match_cls in matches:
+                    if match_cls in per_class_ious:
+                        per_class_ious[match_cls].append(match_iou)
+
             for pi, pred in enumerate(all_preds):
                 if pred.class_id not in per_class_preds[iou_t]:
                     continue
@@ -498,12 +506,22 @@ def run_validation(args: argparse.Namespace) -> None:
     map50    = mean_ap_at(0.50)
     map5095  = mean_ap_range(0.50, 0.95, 0.05)
 
-    # Per-class P/R at IoU=0.50
+    # Per-class mean IoU (from TP matches at IoU threshold 0.50)
+    per_class_miou: Dict[int, float] = {}
+    for c in all_class_ids:
+        if per_class_ious[c]:
+            per_class_miou[c] = float(np.mean(per_class_ious[c]))
+        else:
+            per_class_miou[c] = 0.0
+
+    classes_with_gt = [c for c in all_class_ids if per_class_gt[c] > 0]
+    overall_miou = float(np.mean([per_class_miou[c] for c in classes_with_gt])) if classes_with_gt else 0.0
+
     # -----------------------------------------------------------------------
     # Print results
     # -----------------------------------------------------------------------
-    SEP  = "=" * 72
-    sep2 = "-" * 72
+    SEP  = "=" * 80
+    sep2 = "-" * 80
 
     print()
     print(SEP)
@@ -517,7 +535,7 @@ def run_validation(args: argparse.Namespace) -> None:
     print(sep2)
 
     # Per-class table
-    print(f"  {'Class':<20} {'GT':>6} {'P@50':>8} {'R@50':>8} {'AP@50':>8} {'AP@50:95':>10}")
+    print(f"  {'Class':<20} {'GT':>6} {'P@50':>8} {'R@50':>8} {'AP@50':>8} {'AP@50:95':>10} {'mIoU':>8}")
     print(sep2)
 
     class_aps50   = []
@@ -531,6 +549,7 @@ def run_validation(args: argparse.Namespace) -> None:
         p50, r50 = pr_table[c][0.50]
         ap50    = ap_table[c][0.50]
         ap5095  = float(np.mean([ap_table[c][t] for t in iou_thresholds]))
+        miou_c  = per_class_miou[c]
 
         class_aps50.append(ap50)
         class_aps5095.append(ap5095)
@@ -538,7 +557,7 @@ def run_validation(args: argparse.Namespace) -> None:
         print(
             f"  {name:<20} {gt_n:>6} "
             f"{p50:>8.4f} {r50:>8.4f} "
-            f"{ap50:>8.4f} {ap5095:>10.4f}"
+            f"{ap50:>8.4f} {ap5095:>10.4f} {miou_c:>8.4f}"
         )
 
     print(sep2)
@@ -551,11 +570,12 @@ def run_validation(args: argparse.Namespace) -> None:
     print(
         f"  {'ALL':<20} {total_gt:>6} "
         f"{overall_p50:>8.4f} {overall_r50:>8.4f} "
-        f"{map50:>8.4f} {map5095:>10.4f}"
+        f"{map50:>8.4f} {map5095:>10.4f} {overall_miou:>8.4f}"
     )
     print(sep2)
     print(f"  mAP@50       : {map50:.4f}")
     print(f"  mAP@50:95    : {map5095:.4f}")
+    print(f"  Mean IoU     : {overall_miou:.4f}")
     print(SEP)
     print()
 
