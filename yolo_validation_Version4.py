@@ -429,11 +429,13 @@ def run_validation(args: argparse.Namespace) -> None:
     # Storage:
     # per_class_preds[iou_thresh][class_id] = [(confidence, is_tp), ...]
     # per_class_gt_counts[class_id]         = int
-    # per_class_ious[class_id]              = [iou, ...] (TP IoUs at iou_t == 0.50)
+    # per_class_ious[class_id]              = [iou, ...] (whole-picture IoU per image)
+    # image_ious                            = [iou, ...] (whole-picture IoU per image, all classes)
     iou_thresholds  = [round(t, 2) for t in np.arange(0.50, 1.00, 0.05)]
     per_class_preds = {t: {c: [] for c in all_class_ids} for t in iou_thresholds}
     per_class_gt    = {c: 0 for c in all_class_ids}
     per_class_ious: Dict[int, List[float]] = {c: [] for c in all_class_ids}
+    image_ious: List[float] = []
 
     n_images_with_gt    = 0
     n_images_no_det     = 0
@@ -471,7 +473,11 @@ def run_validation(args: argparse.Namespace) -> None:
                                 conf=args.conf, iou=args.iou, imgsz=args.imgsz)
         if not crops:
             n_images_no_det += 1
-            # All GT instances are FN — no predictions to log, gt counts already added
+            # No predictions → whole-picture IoU is 0 for this image
+            image_ious.append(0.0)
+            for g in gt_instances:
+                if g.class_id in per_class_ious:
+                    per_class_ious[g.class_id].append(0.0)
             continue
 
         # ------------------------------------------------------------------ #
@@ -484,6 +490,39 @@ def run_validation(args: argparse.Namespace) -> None:
             all_preds.extend(preds)
 
         # ------------------------------------------------------------------ #
+        # Whole-picture IoU per image (all classes combined, and per class)
+        # ------------------------------------------------------------------ #
+        # Group masks by class to avoid redundant per-class iterations
+        gt_by_class: Dict[int, np.ndarray] = {}
+        for g in gt_instances:
+            if g.class_id not in gt_by_class:
+                gt_by_class[g.class_id] = np.zeros((img_h, img_w), dtype=bool)
+            gt_by_class[g.class_id] |= poly_to_mask(g.polygon_abs, img_h, img_w)
+
+        pred_by_class: Dict[int, np.ndarray] = {}
+        for p in all_preds:
+            if p.class_id not in pred_by_class:
+                pred_by_class[p.class_id] = np.zeros((img_h, img_w), dtype=bool)
+            m = p.mask if p.mask is not None else poly_to_mask(p.polygon_abs, img_h, img_w)
+            pred_by_class[p.class_id] |= m
+
+        # Whole-image IoU: OR of all GT masks vs OR of all pred masks
+        gt_combined   = np.zeros((img_h, img_w), dtype=bool)
+        pred_combined = np.zeros((img_h, img_w), dtype=bool)
+        for m in gt_by_class.values():
+            gt_combined |= m
+        for m in pred_by_class.values():
+            pred_combined |= m
+        image_ious.append(mask_iou(pred_combined, gt_combined))
+
+        # Per-class whole-picture IoU for this image
+        for c, gt_c in gt_by_class.items():
+            if c not in per_class_ious:
+                continue
+            pred_c = pred_by_class.get(c, np.zeros((img_h, img_w), dtype=bool))
+            per_class_ious[c].append(mask_iou(pred_c, gt_c))
+
+        # ------------------------------------------------------------------ #
         # Match predictions vs GT at each IoU threshold
         # ------------------------------------------------------------------ #
         for iou_t in iou_thresholds:
@@ -491,12 +530,6 @@ def run_validation(args: argparse.Namespace) -> None:
                 all_preds, gt_instances, img_h, img_w, iou_t
             )
             matched_pred_indices = {m[0] for m in matches}
-
-            # Collect TP IoU values at the primary threshold (0.50) for mIoU
-            if iou_t == 0.50:
-                for _, _, match_iou, match_cls in matches:
-                    if match_cls in per_class_ious:
-                        per_class_ious[match_cls].append(match_iou)
 
             for pi, pred in enumerate(all_preds):
                 if pred.class_id not in per_class_preds[iou_t]:
@@ -541,7 +574,7 @@ def run_validation(args: argparse.Namespace) -> None:
     map50    = mean_ap_at(0.50)
     map5095  = mean_ap_range(0.50, 0.95, 0.05)
 
-    # Per-class mean IoU (from TP matches at IoU threshold 0.50)
+    # Per-class mean IoU (whole-picture IoU averaged over images where class appears in GT)
     per_class_miou: Dict[int, float] = {}
     for c in all_class_ids:
         if per_class_ious[c]:
@@ -550,7 +583,7 @@ def run_validation(args: argparse.Namespace) -> None:
             per_class_miou[c] = 0.0
 
     classes_with_gt = [c for c in all_class_ids if per_class_gt[c] > 0]
-    overall_miou = float(np.mean([per_class_miou[c] for c in classes_with_gt])) if classes_with_gt else 0.0
+    mean_image_iou = float(np.mean(image_ious)) if image_ious else 0.0
 
     # -----------------------------------------------------------------------
     # Print results
@@ -605,12 +638,12 @@ def run_validation(args: argparse.Namespace) -> None:
     print(
         f"  {'ALL':<20} {total_gt:>6} "
         f"{overall_p50:>8.4f} {overall_r50:>8.4f} "
-        f"{map50:>8.4f} {map5095:>10.4f} {overall_miou:>8.4f}"
+        f"{map50:>8.4f} {map5095:>10.4f} {mean_image_iou:>8.4f}"
     )
     print(sep2)
     print(f"  mAP@50       : {map50:.4f}")
     print(f"  mAP@50:95    : {map5095:.4f}")
-    print(f"  Mean IoU     : {overall_miou:.4f}")
+    print(f"  Mean IoU     : {mean_image_iou:.4f}")
     print(SEP)
     print()
 
