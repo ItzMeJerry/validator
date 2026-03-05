@@ -57,10 +57,12 @@ class Instance:
         class_id: int,
         polygon_abs: np.ndarray,   # (N,2) absolute pixel coords in original image
         confidence: float = 1.0,   # always 1.0 for GT
+        mask: Optional[np.ndarray] = None,  # pre-computed boolean mask (img_h, img_w)
     ):
         self.class_id    = class_id
         self.polygon_abs = polygon_abs
         self.confidence  = confidence
+        self.mask        = mask
 
 
 # =============================================================================
@@ -205,17 +207,21 @@ def segment_and_remap(
     imgsz: int,
 ) -> List[Instance]:
     """
-    Run Stage 2 segmentation on one crop, then remap predicted polygons
+    Run Stage 2 segmentation on one crop, then remap predicted masks
     back to the original image coordinate space.
 
-    `r.masks.xy` returns polygon coordinates in the crop's pixel space.
-    We shift by the **integer** crop origin so the offset exactly matches
-    the pixel slice used to create the crop, then clamp to image bounds.
+    Uses `r.masks.data` (binary mask at crop resolution) directly to avoid
+    the lossy polygon roundtrip that degrades mask IoU at strict thresholds.
+    The binary mask is placed into a full-size canvas at the integer crop
+    origin.  Polygon coordinates from `r.masks.xy` are still shifted and
+    stored for reference but are not used for IoU evaluation.
     """
     crop_img = crop_info["crop_img"]
     # --- FIX: use integer offsets that match the actual crop origin ---
     int_x1 = crop_info["int_x1"]
     int_y1 = crop_info["int_y1"]
+    crop_w = crop_info["crop_w"]
+    crop_h = crop_info["crop_h"]
     img_w  = crop_info["img_w"]
     img_h  = crop_info["img_h"]
 
@@ -251,10 +257,35 @@ def segment_and_remap(
         abs_poly[:, 0]  = np.clip(abs_poly[:, 0], 0, img_w - 1)
         abs_poly[:, 1]  = np.clip(abs_poly[:, 1], 0, img_h - 1)
 
+        # --- FIX: use binary mask from masks.data for accurate stitching ---
+        # Using the binary mask directly avoids the lossy polygon roundtrip
+        # (mask → polygon contour → rasterize) that introduces quantization
+        # errors at mask boundaries, degrading IoU at strict thresholds.
+        crop_mask_raw = r.masks.data[i].cpu().numpy()
+
+        # Ensure mask is at crop resolution (may differ if model returns
+        # masks at inference or proto resolution)
+        if crop_mask_raw.shape[0] != crop_h or crop_mask_raw.shape[1] != crop_w:
+            crop_mask = cv2.resize(
+                crop_mask_raw.astype(np.float32), (crop_w, crop_h),
+                interpolation=cv2.INTER_LINEAR,
+            ) >= 0.5
+        else:
+            crop_mask = crop_mask_raw >= 0.5
+
+        # Stitch: place crop mask into full-size image at the crop position
+        full_mask = np.zeros((img_h, img_w), dtype=bool)
+        y_end = min(int_y1 + crop_h, img_h)
+        x_end = min(int_x1 + crop_w, img_w)
+        paste_h = y_end - int_y1
+        paste_w = x_end - int_x1
+        full_mask[int_y1:y_end, int_x1:x_end] = crop_mask[:paste_h, :paste_w]
+
         instances.append(Instance(
             class_id    = class_id,
             polygon_abs = abs_poly,
             confidence  = confidence,
+            mask        = full_mask,
         ))
 
     return instances
@@ -281,8 +312,12 @@ def match_predictions_to_gt(
     if not preds or not gts:
         return [], [False] * len(gts)
 
-    # Rasterize all masks once
-    pred_masks = [poly_to_mask(p.polygon_abs, img_h, img_w) for p in preds]
+    # Rasterize all masks once (use pre-computed mask for predictions if available)
+    pred_masks = [
+        p.mask if p.mask is not None
+        else poly_to_mask(p.polygon_abs, img_h, img_w)
+        for p in preds
+    ]
     gt_masks   = [poly_to_mask(g.polygon_abs, img_h, img_w) for g in gts]
 
     gt_matched  = [False] * len(gts)
